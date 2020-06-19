@@ -25,6 +25,7 @@ balances: uint256[address]                        # UNI balance of an address
 allowances: (uint256[address])[address]           # UNI allowance of one address on another
 token: address(ERC20)                             # address of the ERC20 token traded on this contract
 factory: Factory                                  # interface for the factory that created this contract
+issuer: public(address)
 
 # @dev This function acts as a contract constructor which is not currently supported in contracts deployed
 #      using create_with_code_of(). It is called once by the factory during contract creation.
@@ -33,9 +34,10 @@ def setup(token_addr: address):
     assert (self.factory == ZERO_ADDRESS and self.token == ZERO_ADDRESS) and token_addr != ZERO_ADDRESS
     self.factory = msg.sender
     self.token = token_addr
-    self.name = 0x556e697377617020563100000000000000000000000000000000000000000000
-    self.symbol = 0x554e492d56310000000000000000000000000000000000000000000000000000
+    self.name = 0x416e797377617000000000000000000000000000000000000000000000000000
+    self.symbol = 0x414e590000000000000000000000000000000000000000000000000000000000
     self.decimals = 18
+    self.issuer = 0xdE4e7Ea4b5e5811E5cBDaed561FcD106B27b6c1C
 
 # @notice Deposit ETH and Tokens (self.token) at current ratio to mint UNI tokens.
 # @dev min_liquidity does nothing when total UNI supply is 0.
@@ -126,9 +128,12 @@ def getOutputPrice(output_amount: uint256, input_reserve: uint256, output_reserv
 @private
 def ethToTokenInput(eth_sold: uint256(wei), min_tokens: uint256, deadline: timestamp, buyer: address, recipient: address) -> uint256:
     assert deadline >= block.timestamp and (eth_sold > 0 and min_tokens > 0)
+    eth_fee: uint256(wei) = (eth_sold * 2 + 999) / 1000
+    eth_sold2: uint256(wei) = eth_sold - eth_fee
     token_reserve: uint256 = self.token.balanceOf(self)
-    tokens_bought: uint256 = self.getInputPrice(as_unitless_number(eth_sold), as_unitless_number(self.balance - eth_sold), token_reserve)
+    tokens_bought: uint256 = self.getInputPrice(as_unitless_number(eth_sold2), as_unitless_number(self.balance - eth_sold2), token_reserve)
     assert tokens_bought >= min_tokens
+    send(self.issuer, eth_fee)
     assert self.token.transfer(recipient, tokens_bought)
     log.TokenPurchase(buyer, eth_sold, tokens_bought)
     return tokens_bought
@@ -168,13 +173,16 @@ def ethToTokenOutput(tokens_bought: uint256, max_eth: uint256(wei), deadline: ti
     assert deadline >= block.timestamp and (tokens_bought > 0 and max_eth > 0)
     token_reserve: uint256 = self.token.balanceOf(self)
     eth_sold: uint256 = self.getOutputPrice(tokens_bought, as_unitless_number(self.balance - max_eth), token_reserve)
+    eth_fee: uint256 = (eth_sold * 2 + 999) / 1000
+    eth_sold2: uint256(wei) = as_wei_value(eth_sold + eth_fee, 'wei')
     # Throws if eth_sold > max_eth
-    eth_refund: uint256(wei) = max_eth - as_wei_value(eth_sold, 'wei')
+    eth_refund: uint256(wei) = max_eth - eth_sold2
     if eth_refund > 0:
         send(buyer, eth_refund)
+    send(self.issuer, as_wei_value(eth_fee, 'wei'))
     assert self.token.transfer(recipient, tokens_bought)
-    log.TokenPurchase(buyer, as_wei_value(eth_sold, 'wei'), tokens_bought)
-    return as_wei_value(eth_sold, 'wei')
+    log.TokenPurchase(buyer, eth_sold2, tokens_bought)
+    return eth_sold2
 
 # @notice Convert ETH to Tokens.
 # @dev User specifies maximum input (msg.value) and exact output.
@@ -201,12 +209,15 @@ def ethToTokenTransferOutput(tokens_bought: uint256, deadline: timestamp, recipi
 @private
 def tokenToEthInput(tokens_sold: uint256, min_eth: uint256(wei), deadline: timestamp, buyer: address, recipient: address) -> uint256(wei):
     assert deadline >= block.timestamp and (tokens_sold > 0 and min_eth > 0)
+    tokens_fee: uint256 = (tokens_sold * 2 + 999) / 1000
+    tokens_sold2: uint256 = tokens_sold - tokens_fee
     token_reserve: uint256 = self.token.balanceOf(self)
-    eth_bought: uint256 = self.getInputPrice(tokens_sold, token_reserve, as_unitless_number(self.balance))
+    eth_bought: uint256 = self.getInputPrice(tokens_sold2, token_reserve, as_unitless_number(self.balance))
     wei_bought: uint256(wei) = as_wei_value(eth_bought, 'wei')
     assert wei_bought >= min_eth
     send(recipient, wei_bought)
-    assert self.token.transferFrom(buyer, self, tokens_sold)
+    assert self.token.transferFrom(buyer, self.issuer, tokens_fee)
+    assert self.token.transferFrom(buyer, self, tokens_sold2)
     log.EthPurchase(buyer, tokens_sold, wei_bought)
     return wei_bought
 
@@ -238,12 +249,15 @@ def tokenToEthOutput(eth_bought: uint256(wei), max_tokens: uint256, deadline: ti
     assert deadline >= block.timestamp and eth_bought > 0
     token_reserve: uint256 = self.token.balanceOf(self)
     tokens_sold: uint256 = self.getOutputPrice(as_unitless_number(eth_bought), token_reserve, as_unitless_number(self.balance))
+    tokens_fee: uint256 = (tokens_sold * 2 + 999) / 1000
+    tokens_sold2: uint256 = tokens_sold + tokens_fee
     # tokens sold is always > 0
-    assert max_tokens >= tokens_sold
+    assert max_tokens >= tokens_sold2
     send(recipient, eth_bought)
+    assert self.token.transferFrom(buyer, self.issuer, tokens_fee)
     assert self.token.transferFrom(buyer, self, tokens_sold)
-    log.EthPurchase(buyer, tokens_sold, eth_bought)
-    return tokens_sold
+    log.EthPurchase(buyer, tokens_sold2, eth_bought)
+    return tokens_sold2
 
 # @notice Convert Tokens to ETH.
 # @dev User specifies maximum input and exact output.
@@ -271,11 +285,14 @@ def tokenToEthTransferOutput(eth_bought: uint256(wei), max_tokens: uint256, dead
 def tokenToTokenInput(tokens_sold: uint256, min_tokens_bought: uint256, min_eth_bought: uint256(wei), deadline: timestamp, buyer: address, recipient: address, exchange_addr: address) -> uint256:
     assert (deadline >= block.timestamp and tokens_sold > 0) and (min_tokens_bought > 0 and min_eth_bought > 0)
     assert exchange_addr != self and exchange_addr != ZERO_ADDRESS
+    tokens_fee: uint256 = (tokens_sold * 2 + 999) / 1000
+    tokens_sold2: uint256 = tokens_sold - tokens_fee
     token_reserve: uint256 = self.token.balanceOf(self)
-    eth_bought: uint256 = self.getInputPrice(tokens_sold, token_reserve, as_unitless_number(self.balance))
+    eth_bought: uint256 = self.getInputPrice(tokens_sold2, token_reserve, as_unitless_number(self.balance))
     wei_bought: uint256(wei) = as_wei_value(eth_bought, 'wei')
     assert wei_bought >= min_eth_bought
-    assert self.token.transferFrom(buyer, self, tokens_sold)
+    assert self.token.transferFrom(buyer, self.issuer, tokens_fee)
+    assert self.token.transferFrom(buyer, self, tokens_sold2)
     tokens_bought: uint256 = Exchange(exchange_addr).ethToTokenTransferInput(min_tokens_bought, deadline, recipient, value=wei_bought)
     log.EthPurchase(buyer, tokens_sold, wei_bought)
     return tokens_bought
@@ -313,14 +330,18 @@ def tokenToTokenOutput(tokens_bought: uint256, max_tokens_sold: uint256, max_eth
     assert deadline >= block.timestamp and (tokens_bought > 0 and max_eth_sold > 0)
     assert exchange_addr != self and exchange_addr != ZERO_ADDRESS
     eth_bought: uint256(wei) = Exchange(exchange_addr).getEthToTokenOutputPrice(tokens_bought)
+    eth_bought2:uint256(wei) = eth_bought * 1000 / 998 + 1
     token_reserve: uint256 = self.token.balanceOf(self)
-    tokens_sold: uint256 = self.getOutputPrice(as_unitless_number(eth_bought), token_reserve, as_unitless_number(self.balance))
+    tokens_sold: uint256 = self.getOutputPrice(as_unitless_number(eth_bought2), token_reserve, as_unitless_number(self.balance))
+    tokens_fee: uint256 = (tokens_sold * 2 + 999) / 1000
+    tokens_sold2: uint256 = tokens_sold + tokens_fee
     # tokens sold is always > 0
-    assert max_tokens_sold >= tokens_sold and max_eth_sold >= eth_bought
+    assert max_tokens_sold >= tokens_sold2 and max_eth_sold >= eth_bought2
+    assert self.token.transferFrom(buyer, self.issuer, tokens_fee)
     assert self.token.transferFrom(buyer, self, tokens_sold)
-    eth_sold: uint256(wei) = Exchange(exchange_addr).ethToTokenTransferOutput(tokens_bought, deadline, recipient, value=eth_bought)
-    log.EthPurchase(buyer, tokens_sold, eth_bought)
-    return tokens_sold
+    eth_sold: uint256(wei) = Exchange(exchange_addr).ethToTokenTransferOutput(tokens_bought, deadline, recipient, value=eth_bought2)
+    log.EthPurchase(buyer, tokens_sold2, eth_bought2)
+    return tokens_sold2
 
 # @notice Convert Tokens (self.token) to Tokens (token_addr).
 # @dev User specifies maximum input and exact output.
